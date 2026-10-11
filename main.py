@@ -1,3 +1,4 @@
+import json
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
@@ -33,7 +34,53 @@ def root():
 
 @app.get("/items", response_model=List[ItemResponse])
 def get_items(db: Session = Depends(get_db)):
-    return db.query(Item).all()
+
+    # Define the string key name
+    static_cache_key = "catalog:items:static"
+    
+    # Step 1: Check the redis ram first using the key name
+    cached_catalog = redis_client.get(static_cache_key)
+
+    if cached_catalog:
+        print("⚡ Redis Cache HIT! Returning catalog directly from RAM.")
+        items_meta = json.loads(cached_catalog)
+    else:
+        # Cache Miss: Only runs once per hour or on cold start
+        print("🐢 Static Catalog MISS -> Fetching base item metadata from PostgreSQL...")
+        
+        # PROJECTION: Fetch only the specific columns needed, skipping ORM overhead
+        items = db.query(Item.id, Item.name, Item.price).all()
+        
+        # Convert the lightweight Row objects into dictionaries
+        items_meta = [{"id": row.id, "name": row.name, "price": row.price} for row in items]
+        
+        # Now static_cache_key is safely the string "catalog:items:static"
+        redis_client.set(static_cache_key, json.dumps(items_meta), ex=3600)  # 1-hour TTL
+
+    if not items_meta:
+        return[]
+
+
+    # WHERE: Step 2
+    # WHAT: Ask Redis for the live stock of ALL items at the exact same time using 'mget'
+    # WHY: This gets 100% accurate real-time stock in less than 1 millisecond.
+    stock_keys = [f"item:{item['id']}:stock" for item in items_meta]
+    live_stocks = redis_client.mget(stock_keys)
+
+    # WHERE: Step 3
+    # WHAT: Combine the Name/Price with the Live Stock and send it to the user.
+    # WHY: The user sees accurate stock instantly, and PostgreSQL was never touched!
+    response = []
+    for item, stock_val in zip(items_meta, live_stocks):
+        current_stock = int(stock_val) if stock_val is not None else 0
+        response.append({
+            "id": item["id"],
+            "name": item["name"],
+            "price": item["price"],
+            "inventory": {"stock": current_stock}
+        })  
+
+    return response
 
 @app.post("/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 def create_order(order_data: OrderCreate, db: Session = Depends(get_db)):
@@ -83,6 +130,9 @@ def create_order(order_data: OrderCreate, db: Session = Depends(get_db)):
         db.add(new_order)
         db.commit()
         db.refresh(new_order)
+
+        # Invalidate the catalog cache so fresh stock levels reflect immediately
+        #redis_client.delete("catalog:items") //not good thrashing stamped problem
 
         return new_order
 
