@@ -38,7 +38,7 @@ class InventoryBucket(Base):
 class Order(Base):
     __tablename__ = "orders"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(String, primary_key=True, index=True) # Changed to String for UUID
     user_id = Column(Integer, nullable=False, index=True)
     item_id = Column(Integer, ForeignKey("items.id"), nullable=False, index=True)
     quantity = Column(Integer, nullable=False, default=1)
