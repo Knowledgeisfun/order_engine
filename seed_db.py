@@ -18,7 +18,7 @@ def seed_data():
         db.refresh(item1)
         db.refresh(item2)
 
-        inv1 = InventoryBucket(item_id=item1.id, stock=50)
+        inv1 = InventoryBucket(item_id=item1.id, stock=50) 
         inv2 = InventoryBucket(item_id=item2.id, stock=100)
 
         db.add_all([inv1, inv2])

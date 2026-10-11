@@ -1,6 +1,7 @@
 import concurrent.futures
 import json
 import urllib.request
+from collections import Counter
 
 URL = "http://127.0.0.1:8000/orders"
 
@@ -20,12 +21,24 @@ def run_concurrency_test():
     with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
         results = list(executor.map(place_order, range(1, 51)))
 
-    successful = results.count(201)
-    failed = results.count(400)
+    # Count frequencies of all status codes
+    counts = Counter(results)
 
-    print("\n📊 Concurrency Test Results:")
-    print(f"  ✅ Successful Orders (201 Created): {successful}")
-    print(f"  ❌ Rejected / Out of Stock (400 Bad Request): {failed}")
+    print("\n📊 Concurrency Test Results Breakdown:")
+    print(f"  ✅ Successful Orders (201 Created): {counts.get(201, 0)}")
+    print(f"  ❌ Out of Stock Rejections (400 Bad Request): {counts.get(400, 0)}")
+
+    # Track edge-case exceptions cleanly
+    if 404 in counts:
+        print(f"  🔍 Item Not Found (404 Not Found): {counts.get(404, 0)}")
+    if 500 in counts:
+        print(f"  💥 Internal Server Errors (500 Server Error): {counts.get(500, 0)}")
+
+    # Catch any connection drops or raw error strings
+    known_codes = {201, 400, 404, 500}
+    network_errors = {k: v for k, v in counts.items() if k not in known_codes}
+    if network_errors:
+        print(f"  ⚠️ Network / Unexpected Errors: {network_errors}")
 
 if __name__ == "__main__":
     run_concurrency_test()
