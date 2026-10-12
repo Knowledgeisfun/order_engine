@@ -414,16 +414,45 @@ Useful extras: `python reset_db.py` wipes the database, and `python dlq_inspecto
 
 `test_concurrency.py` sends a concurrent burst of buyers, then checks stock integrity and polls each order.
 
-**Latest run: 50 concurrent buyers**
+**Setup:** one Windows laptop, Redis and Kafka in Docker, one `uvicorn` process, one worker.
+
+**Correctness (50 concurrent buyers)**
 
 | Check | Result |
 | :--- | :---: |
-| Requests accepted (`202`) | 100% |
-| Overselling | 0% |
-| Orders visible as `PENDING` right away | 50 / 50 |
+| Requests accepted (`202`) | 50 / 50 |
+| Overselling | 0 |
+| Status readable right after the burst (`PENDING`, or already `COMPLETED` if the worker was fast) | 3 / 3 sampled |
 | Orders reaching `COMPLETED` in Postgres | 50 / 50 |
 
-> 📌 Measured on a single local machine. The throughput numbers in the level descriptions are design goals, not results from this repo.
+**Latency: `POST /orders` sent one at a time (50 requests after warm-up)**
+
+| | Before | After |
+| :--- | :---: | :---: |
+| Median | 10.5 ms | 7.8 ms |
+| p95 | 18.1 ms | 14.1 ms |
+
+Changes between the two runs: `localhost` replaced by `127.0.0.1`, console prints removed from the hot path, and `hset` + `expire` pipelined into one Redis round trip.
+
+**Under a 50-request burst (all 50 sent at the same instant)**
+
+| | Before changes (1 run) | After changes (3 runs) |
+| :--- | :---: | :---: |
+| Time for all 50 `POST /orders` to return | 1,241 ms | median 1,048 ms (range 884 to 1,211) |
+| Average latency per request | 390 ms | median 281 ms (range 276 to 323) |
+
+The burst average mostly reflects requests queueing behind each other in one process, so it is not the cost of a single order. Runs vary by roughly 15 to 20% from one to the next, so treat differences smaller than that as noise.
+
+**Where the time goes**
+
+| Measurement | Result |
+| :--- | :---: |
+| Redis inside its own container (`redis-cli --latency`) | 0.22 ms avg |
+| Python `PING` from the host to Redis | 1.94 ms |
+
+Redis itself is fast. The extra round-trip cost is most likely the Windows-to-Docker network path. Each order makes 3 Redis round trips, so most of the request time is network waiting. A single Lua script would cut that to one round trip.
+
+> 📌 Measured on one local machine. The throughput numbers in the level descriptions are design goals, not results from this repo. End-to-end time until `COMPLETED` was only checked with a fixed 2-second wait.
 
 ---
 
@@ -434,7 +463,8 @@ Useful extras: `python reset_db.py` wipes the database, and `python dlq_inspecto
 - [x] Level 2: Redis cache-aside reads
 - [x] Level 3: Redis atomic stock gate with rollback
 - [x] Level 4: Kafka, `202 Accepted`, background worker, status polling, DLQ
-- [ ] Fix the dual-write gap (rollback on publish failure)
+- [x] Roll back stock and mark the order `FAILED` when Kafka delivery fails (producer errback)
+- [ ] Cover the remaining gap: API crash between the Redis reservation and the Kafka send
 - [ ] Redis stock rebuild / reconciliation job
 - [ ] Level 5: sharded buckets, key salting, worker pool, micro-batching
 - [ ] Larger benchmark (1,000+ buyers) with published results
