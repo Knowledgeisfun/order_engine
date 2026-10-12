@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from typing import List
 import redis
 
-# Added the Kafka producer import
+# Kafka producer for publishing order events
 from kafka_producer import send_order_event
 
 from schemas import ItemResponse, OrderCreate, OrderResponse
@@ -14,10 +14,21 @@ from models import Item, InventoryBucket, Order, OrderStatus
 
 app = FastAPI(title="Distributed High-Throughput Order Engine")
 
+# Printing to the console is slow on Windows, so I only log when debugging.
+# Keep this False while benchmarking, True for demos.
+DEBUG_LOGS = False
+
+def log(message: str):
+    if DEBUG_LOGS:
+        print(message)
+
 # 1. connect to redis
-redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+# using 127.0.0.1 instead of localhost, localhost can resolve to IPv6 first on Windows and add delay
+redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
 
 # 2. seed redis data on ram on startup
+# TODO: this overwrites Redis stock with the Postgres value on every restart.
+# Only safe if worker.py also decrements InventoryBucket.stock when it saves an order. Need to verify.
 @app.on_event("startup")
 def startup_event():
     db = SessionLocal()
@@ -44,11 +55,11 @@ def get_items(db: Session = Depends(get_db)):
     cached_catalog = redis_client.get(static_cache_key)
 
     if cached_catalog:
-        print("⚡ Redis Cache HIT! Returning catalog directly from RAM.")
+        log("⚡ Redis Cache HIT! Returning catalog directly from RAM.")
         items_meta = json.loads(cached_catalog)
     else:
         # Cache Miss: Only runs once per hour or on cold start
-        print("🐢 Static Catalog MISS -> Fetching base item metadata from PostgreSQL...")
+        log("🐢 Static Catalog MISS -> Fetching base item metadata from PostgreSQL...")
         
         # PROJECTION: Fetch only the specific columns needed, skipping ORM overhead
         items = db.query(Item.id, Item.name, Item.price).all()
@@ -62,15 +73,13 @@ def get_items(db: Session = Depends(get_db)):
     if not items_meta:
         return []
 
-    # WHERE: Step 2
-    # WHAT: Ask Redis for the live stock of ALL items at the exact same time using 'mget'
-    # WHY: This gets 100% accurate real-time stock in less than 1 millisecond.
+    # Step 2: get live stock for ALL items in one round trip with mget.
+    # Name and price are cached for an hour, but stock has to be live, so it comes from Redis.
     stock_keys = [f"item:{item['id']}:stock" for item in items_meta]
     live_stocks = redis_client.mget(stock_keys)
 
-    # WHERE: Step 3
-    # WHAT: Combine the Name/Price with the Live Stock and send it to the user.
-    # WHY: The user sees accurate stock instantly, and PostgreSQL was never touched!
+    # Step 3: combine name/price with live stock and send it back.
+    # Postgres is never touched on a cache hit.
     response = []
     for item, stock_val in zip(items_meta, live_stocks):
         current_stock = int(stock_val) if stock_val is not None else 0
@@ -83,7 +92,9 @@ def get_items(db: Session = Depends(get_db)):
 
     return response
 
-# Changed to 202 ACCEPTED and removed response_model since we return a tracking UUID now
+
+# 202 ACCEPTED instead of 201: the order is queued, not saved yet.
+# No response_model since we return a tracking UUID now.
 @app.post("/orders", status_code=status.HTTP_202_ACCEPTED)
 def create_order(order_data: OrderCreate, db: Session = Depends(get_db)):
 
@@ -100,7 +111,9 @@ def create_order(order_data: OrderCreate, db: Session = Depends(get_db)):
         
         # If item exists in DB but not in Redis, warm up the cache
         inv = db.query(InventoryBucket).filter(InventoryBucket.item_id == order_data.item_id).first()
-        redis_client.set(redis_key, inv.stock if inv else 0)
+        # nx=True so only the first request warms the cache. Without it, two concurrent
+        # requests can overwrite each other's DECRBY and the stock jumps back up.
+        redis_client.set(redis_key, inv.stock if inv else 0, nx=True)
 
     # sub millisecond ram reservation 
     remaining_stock = redis_client.decrby(redis_key, order_data.quantity)
@@ -149,25 +162,38 @@ def create_order(order_data: OrderCreate, db: Session = Depends(get_db)):
         "status": "PENDING"
     }
 
-    # 4. Fire to Kafka and forget (No DB write here! Response is < 2ms)
+    # producer.send() is async, so a delivery failure can happen after this function has
+    # already moved on and the try/except below would never see it.
+    # This callback handles that case: put the stock back and mark the order FAILED.
+    # It runs on Kafka's background thread (the redis client is thread-safe).
+    def compensate(exc):
+        redis_client.incrby(redis_key, order_data.quantity)
+        redis_client.hset(f"order:{order_id}:status", "status", "FAILED")
+        print(f"❌ Kafka delivery failed for {order_id}: {exc}")
+
+    # 4. Send to Kafka. No DB write here, worker.py handles that.
     try:
         # Set initial status in Redis RAM so immediate polling finds "PENDING"
-        redis_client.hset(f"order:{order_id}:status", mapping={
+        # one round trip instead of two
+        pipe = redis_client.pipeline()
+        pipe.hset(f"order:{order_id}:status", mapping={
             "status": "PENDING",
             "item_id": order_data.item_id,
             "quantity": order_data.quantity
         })
-        redis_client.expire(f"order:{order_id}:status", 600)  # 10-minute TTL
+        pipe.expire(f"order:{order_id}:status", 600)  # 10-minute TTL
+        pipe.execute()
 
-        send_order_event(event_payload)
+        send_order_event(event_payload, on_error=compensate)
     except Exception as e:
-        # If Kafka itself goes down, clean up the status key and roll back stock
+        # send() failed right away (e.g. Kafka is down), so the callback was never attached.
+        # Clean up the status key, give the stock back, and tell the client to retry.
         redis_client.delete(f"order:{order_id}:status")
         redis_client.incrby(redis_key, order_data.quantity)
-        raise HTTPException(status_code=500, detail="Failed to queue order event")
+        raise HTTPException(status_code=503, detail="Failed to queue order event")
     return {"order_id": order_id, "message": "Order queued successfully"}
-
-# 5. NEW: Status Polling Endpoint
+ 
+# 5. Status Polling Endpoint
 @app.get("/orders/{order_id}") 
 def get_order_status(order_id: str, db: Session = Depends(get_db)):
     # Fast Path: Check Redis RAM (< 1ms lookup)
